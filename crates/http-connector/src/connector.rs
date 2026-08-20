@@ -19,7 +19,6 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -303,29 +302,68 @@ impl ConnectingTcpRemote {
     }
 }
 
+fn get_proxy_host_port(proxy: &str) -> Result<(&str, u16), ConnectError> {
+    let (host, port) = proxy.rsplit_once(':').ok_or_else(|| ConnectError {
+        msg: "Invalid proxy setting".into(),
+        cause: None,
+    })?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port: u16 = port
+        .parse()
+        .map_err(|e| ConnectError::new("Invalid proxy setting", e))?;
+    Ok((host, port))
+}
+
+async fn resolve_proxy_host_port(proxy_str: &str) -> Result<resolver::SocketAddrs, ConnectError> {
+    let resolver = ForgeResolver::new();
+    let proxy_addrs = {
+        let (proxy_host, proxy_port) = get_proxy_host_port(proxy_str)?;
+        if let Some(addrs) = resolver::SocketAddrs::try_parse(proxy_host, proxy_port) {
+            addrs
+        } else {
+            let dns_name: Name = proxy_host.parse().map_err(ConnectError::dns)?;
+            let addrs = resolver.call(dns_name).await.map_err(ConnectError::dns)?;
+            resolver::SocketAddrs::new(
+                addrs
+                    .map(|mut addr| {
+                        addr.set_port(proxy_port);
+                        addr
+                    })
+                    .collect(),
+            )
+        }
+    };
+    Ok(proxy_addrs)
+}
+
 impl ConnectingTcpRemote {
     async fn connect(&mut self, config: &Config) -> Result<TcpStream, ConnectError> {
         let mut err = None;
         for addr in &mut self.addrs {
             if let Some(proxy) = config.socks5_proxy.as_deref() {
-                let proxy_addr = SocketAddr::from_str(proxy)
-                    .map_err(|e| ConnectError::new("Invalid proxy setting", e))?;
-                let connect_start = Instant::now();
-                match connect_with_socks_proxy(
-                    proxy_addr,
-                    addr,
-                    config.clone(),
-                    self.connect_timeout,
-                )?
-                .await
-                {
-                    Ok(tcp) => {
-                        self.metrics.connect_success(proxy_addr, connect_start);
-                        return Ok(tcp);
-                    }
-                    Err(e) => {
-                        self.metrics.connect_error(proxy_addr, connect_start, &e);
-                        err = Some(e);
+                let proxy_addrs: resolver::SocketAddrs = resolve_proxy_host_port(proxy)
+                    .await
+                    .inspect_err(|e| info!("cannot resolve configured proxy '{proxy}': {e}"))?;
+
+                // try all resolved proxy addrs
+                for proxy_addr in proxy_addrs {
+                    let connect_start = Instant::now();
+                    match connect_with_socks_proxy(
+                        proxy_addr,
+                        addr,
+                        config.clone(),
+                        self.connect_timeout,
+                    )?
+                    .await
+                    {
+                        Ok(tcp) => {
+                            self.metrics.connect_success(proxy_addr, connect_start);
+                            return Ok(tcp);
+                        }
+                        Err(e) => {
+                            self.metrics.connect_error(proxy_addr, connect_start, &e);
+                            err = Some(e);
+                        }
                     }
                 }
             } else {
